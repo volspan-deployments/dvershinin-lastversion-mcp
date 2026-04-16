@@ -9,8 +9,6 @@ import asyncio
 import subprocess
 import sys
 import json
-import tempfile
-import shutil
 from typing import Optional
 
 mcp = FastMCP("lastversion")
@@ -19,30 +17,42 @@ GITHUB_API_TOKEN = os.environ.get("GITHUB_API_TOKEN", "")
 
 
 def build_env():
-    """Build environment variables for subprocess calls."""
+    """Build environment variables for lastversion subprocess calls."""
     env = os.environ.copy()
     if GITHUB_API_TOKEN:
         env["GITHUB_API_TOKEN"] = GITHUB_API_TOKEN
     return env
 
 
-async def run_lastversion(*args, capture_output=True):
-    """Run lastversion CLI command asynchronously."""
+async def run_lastversion(*args) -> dict:
+    """Run lastversion CLI with given arguments and return result."""
     cmd = [sys.executable, "-m", "lastversion"] + list(args)
     env = build_env()
-    
-    loop = asyncio.get_event_loop()
-    result = await loop.run_in_executor(
-        None,
-        lambda: subprocess.run(
-            cmd,
-            capture_output=capture_output,
-            text=True,
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             env=env,
-            timeout=60
         )
-    )
-    return result
+        stdout, stderr = await proc.communicate()
+        return {
+            "returncode": proc.returncode,
+            "stdout": stdout.decode("utf-8", errors="replace").strip(),
+            "stderr": stderr.decode("utf-8", errors="replace").strip(),
+        }
+    except FileNotFoundError:
+        return {
+            "returncode": -1,
+            "stdout": "",
+            "stderr": "lastversion is not installed. Install it with: pip install lastversion",
+        }
+    except Exception as e:
+        return {
+            "returncode": -1,
+            "stdout": "",
+            "stderr": str(e),
+        }
 
 
 @mcp.tool()
@@ -51,431 +61,291 @@ async def get_latest_version(
     pre_ok: bool = False,
     major: Optional[str] = None,
     at: Optional[str] = None,
-    format: str = "version"
 ) -> dict:
-    """Get the latest stable version of a project from GitHub, GitLab, PyPI, npm, or other supported sources."""
+    """Get the latest stable version of a project from GitHub, GitLab, PyPI, npm, or other supported sources.
+    Use this when you need to know the current stable release version of any open source project or software package.
+    """
     args = [project]
-    
     if pre_ok:
         args.append("--pre")
     if major:
         args.extend(["--major", major])
     if at:
         args.extend(["--at", at])
-    
-    if format == "json":
-        args.extend(["--format", "json"])
-    elif format == "dict":
-        args.extend(["--format", "dict"])
-    # default is version string output
-    
-    try:
-        result = await run_lastversion(*args)
-        
-        if result.returncode == 0:
-            output = result.stdout.strip()
-            if format == "json":
-                try:
-                    return {"success": True, "project": project, "data": json.loads(output)}
-                except json.JSONDecodeError:
-                    return {"success": True, "project": project, "version": output}
-            else:
-                return {"success": True, "project": project, "version": output}
-        else:
-            return {
-                "success": False,
-                "project": project,
-                "error": result.stderr.strip() or "No version found or project not found",
-                "returncode": result.returncode
-            }
-    except subprocess.TimeoutExpired:
-        return {"success": False, "project": project, "error": "Request timed out after 60 seconds"}
-    except Exception as e:
-        return {"success": False, "project": project, "error": str(e)}
+
+    result = await run_lastversion(*args)
+
+    if result["returncode"] == 0 and result["stdout"]:
+        return {
+            "success": True,
+            "project": project,
+            "latest_version": result["stdout"],
+            "pre_ok": pre_ok,
+            "major": major,
+            "at": at,
+        }
+    else:
+        return {
+            "success": False,
+            "project": project,
+            "error": result["stderr"] or "Could not determine latest version",
+            "stdout": result["stdout"],
+            "returncode": result["returncode"],
+        }
 
 
 @mcp.tool()
 async def check_version(
     project: str,
     version: str,
-    pre_ok: bool = False,
-    at: Optional[str] = None
+    at: Optional[str] = None,
 ) -> dict:
-    """Check if a given version is the latest for a project, or compare a local version against the latest."""
-    # First get the latest version
-    get_args = [project]
-    if pre_ok:
-        get_args.append("--pre")
+    """Check whether a given version of a project is the latest stable release.
+    Returns whether the version is up-to-date or outdated.
+    """
+    args = [project, "-gt", version]
     if at:
-        get_args.extend(["--at", at])
-    
-    try:
-        result = await run_lastversion(*get_args)
-        
-        if result.returncode != 0:
-            return {
-                "success": False,
-                "project": project,
-                "error": result.stderr.strip() or "Could not retrieve latest version",
-                "returncode": result.returncode
-            }
-        
-        latest_version = result.stdout.strip()
-        
-        # Compare versions using lastversion's format/comparison capability
-        # Use the -eq flag style comparison
-        eq_args = [version, "-eq", latest_version]
-        eq_result = await run_lastversion(*eq_args)
-        is_equal = eq_result.returncode == 0
-        
-        gt_args = [version, "-gt", latest_version]
-        gt_result = await run_lastversion(*gt_args)
-        is_newer = gt_result.returncode == 0
-        
-        lt_args = [version, "-lt", latest_version]
-        lt_result = await run_lastversion(*lt_args)
-        is_older = lt_result.returncode == 0
-        
-        status = "up_to_date" if is_equal else ("outdated" if is_older else "newer_than_latest")
-        
+        args.extend(["--at", at])
+
+    result = await run_lastversion(*args)
+
+    # lastversion exits 0 if the latest > provided version (i.e., provided is outdated)
+    # exits 1 if the provided version is up-to-date or latest
+    # Also get the actual latest version for comparison
+    latest_result = await get_latest_version(project, at=at)
+    latest_ver = latest_result.get("latest_version", "unknown")
+
+    if result["returncode"] == 0:
+        # Latest version is greater than checked version -> outdated
         return {
             "success": True,
             "project": project,
             "checked_version": version,
-            "latest_version": latest_version,
-            "is_latest": is_equal,
-            "is_outdated": is_older,
-            "is_newer_than_latest": is_newer,
-            "status": status
+            "latest_version": latest_ver,
+            "is_latest": False,
+            "is_outdated": True,
+            "message": f"Version {version} is outdated. Latest is {latest_ver}.",
         }
-    except subprocess.TimeoutExpired:
-        return {"success": False, "project": project, "error": "Request timed out after 60 seconds"}
-    except Exception as e:
-        return {"success": False, "project": project, "error": str(e)}
+    elif result["returncode"] == 1:
+        # The checked version is already the latest
+        return {
+            "success": True,
+            "project": project,
+            "checked_version": version,
+            "latest_version": latest_ver,
+            "is_latest": True,
+            "is_outdated": False,
+            "message": f"Version {version} is the latest stable release.",
+        }
+    else:
+        return {
+            "success": False,
+            "project": project,
+            "checked_version": version,
+            "error": result["stderr"] or "Could not check version",
+            "returncode": result["returncode"],
+        }
 
 
 @mcp.tool()
-async def download_asset(
+async def download_latest(
     project: str,
     output_dir: str = ".",
     asset_filter: Optional[str] = None,
-    pre_ok: bool = False,
-    at: Optional[str] = None
-) -> dict:
-    """Download the latest release asset or source archive for a project."""
-    # Ensure output directory exists
-    os.makedirs(output_dir, exist_ok=True)
-    
-    args = ["--download", project]
-    
-    if pre_ok:
-        args.append("--pre")
-    if at:
-        args.extend(["--at", at])
-    if asset_filter:
-        args.extend(["--filter", asset_filter])
-    if output_dir and output_dir != ".":
-        args.extend(["--output-dir", output_dir])
-    
-    try:
-        result = await run_lastversion(*args)
-        
-        if result.returncode == 0:
-            output = result.stdout.strip()
-            return {
-                "success": True,
-                "project": project,
-                "output_dir": output_dir,
-                "message": output or "Download completed successfully",
-                "details": result.stderr.strip() if result.stderr else None
-            }
-        else:
-            return {
-                "success": False,
-                "project": project,
-                "error": result.stderr.strip() or result.stdout.strip() or "Download failed",
-                "returncode": result.returncode
-            }
-    except subprocess.TimeoutExpired:
-        return {"success": False, "project": project, "error": "Download timed out after 60 seconds"}
-    except Exception as e:
-        return {"success": False, "project": project, "error": str(e)}
-
-
-@mcp.tool()
-async def install_package(
-    project: str,
-    pre_ok: bool = False,
     at: Optional[str] = None,
-    asset_filter: Optional[str] = None
+    pre_ok: bool = False,
 ) -> dict:
-    """Download and install the latest release of a project using the system package manager or direct installation."""
-    args = ["--install", project]
-    
+    """Download the latest release assets of a project to a local directory.
+    Use this when you need to fetch the actual release files (tarballs, binaries, etc.) for a project.
+    """
+    args = ["--download"]
+    if output_dir and output_dir != ".":
+        args = ["--download", output_dir]
     if pre_ok:
         args.append("--pre")
     if at:
         args.extend(["--at", at])
     if asset_filter:
         args.extend(["--filter", asset_filter])
-    
-    try:
-        result = await run_lastversion(*args)
-        
-        if result.returncode == 0:
-            output = result.stdout.strip()
-            return {
-                "success": True,
-                "project": project,
-                "message": output or "Installation completed successfully",
-                "details": result.stderr.strip() if result.stderr else None
-            }
-        else:
-            return {
-                "success": False,
-                "project": project,
-                "error": result.stderr.strip() or result.stdout.strip() or "Installation failed",
-                "returncode": result.returncode
-            }
-    except subprocess.TimeoutExpired:
-        return {"success": False, "project": project, "error": "Installation timed out after 60 seconds"}
-    except Exception as e:
-        return {"success": False, "project": project, "error": str(e)}
+    args.append(project)
+
+    result = await run_lastversion(*args)
+
+    if result["returncode"] == 0:
+        return {
+            "success": True,
+            "project": project,
+            "output_dir": output_dir,
+            "asset_filter": asset_filter,
+            "message": result["stdout"] or "Download completed successfully",
+            "stderr": result["stderr"],
+        }
+    else:
+        return {
+            "success": False,
+            "project": project,
+            "error": result["stderr"] or "Download failed",
+            "stdout": result["stdout"],
+            "returncode": result["returncode"],
+        }
 
 
 @mcp.tool()
-async def get_release_info(
+async def install_latest(
     project: str,
+    at: Optional[str] = None,
     pre_ok: bool = False,
-    major: Optional[str] = None,
-    at: Optional[str] = None
 ) -> dict:
-    """Retrieve full metadata and release information about the latest version of a project."""
-    args = [project, "--format", "json"]
-    
+    """Download and install the latest release of a project using the system's package manager or by running the installer.
+    Use this when you want to actually install software, not just check its version.
+    """
+    args = ["--install", project]
     if pre_ok:
         args.append("--pre")
-    if major:
-        args.extend(["--major", major])
     if at:
         args.extend(["--at", at])
-    
-    try:
-        result = await run_lastversion(*args)
-        
-        if result.returncode == 0:
-            output = result.stdout.strip()
-            try:
-                data = json.loads(output)
-                return {
-                    "success": True,
-                    "project": project,
-                    "release_info": data
-                }
-            except json.JSONDecodeError:
-                return {
-                    "success": True,
-                    "project": project,
-                    "raw_output": output
-                }
-        else:
-            return {
-                "success": False,
-                "project": project,
-                "error": result.stderr.strip() or "Could not retrieve release info",
-                "returncode": result.returncode
-            }
-    except subprocess.TimeoutExpired:
-        return {"success": False, "project": project, "error": "Request timed out after 60 seconds"}
-    except Exception as e:
-        return {"success": False, "project": project, "error": str(e)}
+
+    result = await run_lastversion(*args)
+
+    if result["returncode"] == 0:
+        return {
+            "success": True,
+            "project": project,
+            "message": result["stdout"] or "Installation completed successfully",
+            "stderr": result["stderr"],
+        }
+    else:
+        return {
+            "success": False,
+            "project": project,
+            "error": result["stderr"] or "Installation failed",
+            "stdout": result["stdout"],
+            "returncode": result["returncode"],
+        }
 
 
 @mcp.tool()
-async def get_assets_list(
+async def get_release_assets(
     project: str,
+    asset_filter: Optional[str] = None,
+    at: Optional[str] = None,
     pre_ok: bool = False,
-    major: Optional[str] = None,
-    at: Optional[str] = None
 ) -> dict:
-    """List all downloadable assets available in the latest release of a project."""
-    # Get release info in JSON format which includes assets
-    args = [project, "--format", "json"]
-    
+    """List or retrieve the download URLs for assets of the latest release of a project.
+    Use this when you need to know what files are available in the latest release without downloading them.
+    """
+    args = ["--assets", project]
     if pre_ok:
         args.append("--pre")
-    if major:
-        args.extend(["--major", major])
     if at:
         args.extend(["--at", at])
-    
-    try:
-        result = await run_lastversion(*args)
-        
-        if result.returncode == 0:
-            output = result.stdout.strip()
-            try:
-                data = json.loads(output)
-                # Extract assets from the release info
-                assets = []
-                
-                # Handle different possible JSON structures
-                if isinstance(data, dict):
-                    # Look for common asset fields in lastversion JSON output
-                    if "assets" in data:
-                        raw_assets = data["assets"]
-                        if isinstance(raw_assets, list):
-                            for asset in raw_assets:
-                                if isinstance(asset, dict):
-                                    assets.append({
-                                        "name": asset.get("name", ""),
-                                        "url": asset.get("browser_download_url", asset.get("url", "")),
-                                        "size": asset.get("size", None),
-                                        "content_type": asset.get("content_type", None),
-                                        "download_count": asset.get("download_count", None)
-                                    })
-                                elif isinstance(asset, str):
-                                    assets.append({"url": asset})
-                        elif isinstance(raw_assets, dict):
-                            for name, url in raw_assets.items():
-                                assets.append({"name": name, "url": url})
-                    
-                    version_str = data.get("version", data.get("tag_name", ""))
-                    tag = data.get("tag_name", "")
-                    source_url = data.get("source", data.get("tarball_url", ""))
-                    
-                    # If no assets found but we have source URL, add it
-                    if not assets and source_url:
-                        assets.append({"name": "source_tarball", "url": source_url})
-                    
-                    return {
-                        "success": True,
-                        "project": project,
-                        "version": version_str,
-                        "tag": tag,
-                        "assets": assets,
-                        "asset_count": len(assets),
-                        "full_data": data
-                    }
-                else:
-                    return {
-                        "success": True,
-                        "project": project,
-                        "raw_output": output,
-                        "assets": []
-                    }
-            except json.JSONDecodeError:
-                return {
-                    "success": True,
-                    "project": project,
-                    "raw_output": output,
-                    "assets": [],
-                    "note": "Could not parse JSON output"
-                }
-        else:
-            return {
-                "success": False,
-                "project": project,
-                "error": result.stderr.strip() or "Could not retrieve assets",
-                "returncode": result.returncode
-            }
-    except subprocess.TimeoutExpired:
-        return {"success": False, "project": project, "error": "Request timed out after 60 seconds"}
-    except Exception as e:
-        return {"success": False, "project": project, "error": str(e)}
+    if asset_filter:
+        args.extend(["--filter", asset_filter])
+
+    result = await run_lastversion(*args)
+
+    if result["returncode"] == 0 and result["stdout"]:
+        asset_urls = [line.strip() for line in result["stdout"].splitlines() if line.strip()]
+        return {
+            "success": True,
+            "project": project,
+            "asset_filter": asset_filter,
+            "assets": asset_urls,
+            "count": len(asset_urls),
+        }
+    else:
+        return {
+            "success": False,
+            "project": project,
+            "error": result["stderr"] or "Could not retrieve release assets",
+            "stdout": result["stdout"],
+            "returncode": result["returncode"],
+        }
+
+
+@mcp.tool()
+async def get_release_notes(
+    project: str,
+    version: Optional[str] = None,
+    at: Optional[str] = None,
+) -> dict:
+    """Retrieve the changelog or release notes for the latest (or a specific) version of a project.
+    Use this when a user wants to know what changed in the latest release.
+    """
+    args = ["--changelog", project]
+    if at:
+        args.extend(["--at", at])
+    if version:
+        # lastversion does not have a direct --version flag for changelog,
+        # but we pass the version as a reference for informational purposes
+        pass
+
+    result = await run_lastversion(*args)
+
+    if result["returncode"] == 0 and result["stdout"]:
+        return {
+            "success": True,
+            "project": project,
+            "version": version,
+            "release_notes": result["stdout"],
+        }
+    else:
+        return {
+            "success": False,
+            "project": project,
+            "version": version,
+            "error": result["stderr"] or "Could not retrieve release notes",
+            "stdout": result["stdout"],
+            "returncode": result["returncode"],
+        }
 
 
 @mcp.tool()
 async def get_source_url(
     project: str,
-    asset_filter: Optional[str] = None,
+    format: str = "tar",
+    at: Optional[str] = None,
+    major: Optional[str] = None,
     pre_ok: bool = False,
-    at: Optional[str] = None
 ) -> dict:
-    """Get the direct download URL for the latest release source archive or a specific asset of a project."""
-    args = ["--source-only", project]
-    
+    """Get the source tarball or zip URL for the latest release of a project without downloading it.
+    Use this when you need a direct URL to embed in scripts, Dockerfiles, or build configurations.
+    """
+    if format == "zip":
+        format_flag = "--format"
+        format_value = "zip"
+    else:
+        format_flag = "--format"
+        format_value = "tar"
+
+    args = [format_flag, format_value, project]
     if pre_ok:
         args.append("--pre")
     if at:
         args.extend(["--at", at])
-    if asset_filter:
-        args.extend(["--filter", asset_filter])
-    
-    try:
-        result = await run_lastversion(*args)
-        
-        if result.returncode == 0:
-            url = result.stdout.strip()
-            if url:
-                return {
-                    "success": True,
-                    "project": project,
-                    "url": url,
-                    "asset_filter": asset_filter
-                }
-            else:
-                # Try alternative approach - get JSON and extract URL
-                json_args = [project, "--format", "json"]
-                if pre_ok:
-                    json_args.append("--pre")
-                if at:
-                    json_args.extend(["--at", at])
-                
-                json_result = await run_lastversion(*json_args)
-                if json_result.returncode == 0:
-                    try:
-                        data = json.loads(json_result.stdout.strip())
-                        source_url = data.get("source", data.get("tarball_url", data.get("url", "")))
-                        return {
-                            "success": True,
-                            "project": project,
-                            "url": source_url,
-                            "asset_filter": asset_filter,
-                            "note": "URL extracted from JSON metadata"
-                        }
-                    except (json.JSONDecodeError, KeyError):
-                        pass
-                
-                return {
-                    "success": False,
-                    "project": project,
-                    "error": "No URL found in output"
-                }
-        else:
-            # Fallback: try without --source-only flag and get JSON
-            json_args = [project, "--format", "json"]
-            if pre_ok:
-                json_args.append("--pre")
-            if at:
-                json_args.extend(["--at", at])
-            
-            json_result = await run_lastversion(*json_args)
-            if json_result.returncode == 0:
-                try:
-                    data = json.loads(json_result.stdout.strip())
-                    source_url = data.get("source", data.get("tarball_url", data.get("url", "")))
-                    if source_url:
-                        return {
-                            "success": True,
-                            "project": project,
-                            "url": source_url,
-                            "asset_filter": asset_filter,
-                            "note": "URL extracted from JSON metadata (fallback)"
-                        }
-                except (json.JSONDecodeError, KeyError):
-                    pass
-            
-            return {
-                "success": False,
-                "project": project,
-                "error": result.stderr.strip() or "Could not retrieve source URL",
-                "returncode": result.returncode
-            }
-    except subprocess.TimeoutExpired:
-        return {"success": False, "project": project, "error": "Request timed out after 60 seconds"}
-    except Exception as e:
-        return {"success": False, "project": project, "error": str(e)}
+    if major:
+        args.extend(["--major", major])
+
+    result = await run_lastversion(*args)
+
+    if result["returncode"] == 0 and result["stdout"]:
+        return {
+            "success": True,
+            "project": project,
+            "format": format,
+            "source_url": result["stdout"],
+            "major": major,
+            "at": at,
+        }
+    else:
+        return {
+            "success": False,
+            "project": project,
+            "format": format,
+            "error": result["stderr"] or "Could not retrieve source URL",
+            "stdout": result["stdout"],
+            "returncode": result["returncode"],
+        }
 
 
 

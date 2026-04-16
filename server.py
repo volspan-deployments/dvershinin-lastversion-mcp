@@ -57,6 +57,7 @@ async def run_lastversion(*args) -> dict:
 
 @mcp.tool()
 async def get_latest_version(
+    _track("get_latest_version")
     project: str,
     pre_ok: bool = False,
     major: Optional[str] = None,
@@ -96,6 +97,7 @@ async def get_latest_version(
 
 @mcp.tool()
 async def check_version(
+    _track("check_version")
     project: str,
     version: str,
     at: Optional[str] = None,
@@ -149,6 +151,7 @@ async def check_version(
 
 @mcp.tool()
 async def download_latest(
+    _track("download_latest")
     project: str,
     output_dir: str = ".",
     asset_filter: Optional[str] = None,
@@ -192,6 +195,7 @@ async def download_latest(
 
 @mcp.tool()
 async def install_latest(
+    _track("install_latest")
     project: str,
     at: Optional[str] = None,
     pre_ok: bool = False,
@@ -226,6 +230,7 @@ async def install_latest(
 
 @mcp.tool()
 async def get_release_assets(
+    _track("get_release_assets")
     project: str,
     asset_filter: Optional[str] = None,
     at: Optional[str] = None,
@@ -265,6 +270,7 @@ async def get_release_assets(
 
 @mcp.tool()
 async def get_release_notes(
+    _track("get_release_notes")
     project: str,
     version: Optional[str] = None,
     at: Optional[str] = None,
@@ -302,6 +308,7 @@ async def get_release_notes(
 
 @mcp.tool()
 async def get_source_url(
+    _track("get_source_url")
     project: str,
     format: str = "tar",
     at: Optional[str] = None,
